@@ -1,5 +1,8 @@
 import os
 import logging
+import asyncio
+from threading import Thread
+from flask import Flask
 from telegram import ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler
 from telegram.ext.filters import TEXT, COMMAND
@@ -14,6 +17,27 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
+
+# Flask приложение для health check
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return {'status': 'Bot is running', 'message': 'CryptoSignalBot is healthy'}, 200
+
+@app.route('/health')
+def health():
+    return {'status': 'healthy'}, 200
+
+@app.route('/status')
+def status():
+    return {'bot': 'active', 'service': 'telegram-crypto-bot'}, 200
+
+def run_flask():
+    """Запускает Flask сервер в отдельном потоке"""
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f"Starting Flask server on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # Фиксированная клавиатура внизу с эмодзи
 reply_keyboard = ReplyKeyboardMarkup(
@@ -97,6 +121,11 @@ def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN not found in environment variables!")
         raise ValueError("TELEGRAM_TOKEN environment variable is required")
+    
+    # Запускаем Flask сервер в отдельном потоке
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask health check server started")
     
     logger.info("Starting CryptoSignalBot...")
     

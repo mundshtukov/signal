@@ -2,7 +2,7 @@ import requests
 import asyncio
 import random
 import logging
-from config import BINANCE_API_URL, COINGECKO_API_URL, ALTERNATIVE_API_URL
+from config import BYBIT_API_URL, COINGECKO_API_URL, ALTERNATIVE_API_URL
 from utils import calculate_risk_reward, format_signal
 from datetime import datetime, timedelta
 import time
@@ -22,79 +22,49 @@ HEADERS = {
     'Sec-Fetch-Site': 'same-origin'
 }
 
-# Список альтернативных Binance endpoints
-BINANCE_ENDPOINTS = [
-    'https://api.binance.com',
-    'https://api1.binance.com',
-    'https://api2.binance.com',
-    'https://api3.binance.com'
-]
-
-# Список proxy серверов (можно добавить свои)
-PROXY_LIST = [
-    # Добавьте рабочие proxy если есть
-    # {'http': 'http://proxy:port', 'https': 'https://proxy:port'}
-]
-
 async def sleep_random():
-    """Случайная задержка от 1 до 2 секунд для избежания rate limiting"""
-    await asyncio.sleep(random.uniform(1.0, 2.0))
+    """Случайная задержка от 0.5 до 1 секунды"""
+    await asyncio.sleep(random.uniform(0.5, 1.0))
 
 def make_request_with_retry(url, params=None, max_retries=3):
-    """Делает запрос с повторными попытками и разными endpoint'ами"""
+    """Делает запрос с повторными попытками"""
     
     for attempt in range(max_retries):
-        # Пробуем разные endpoints для Binance
-        if 'api.binance.com' in url:
-            for endpoint in BINANCE_ENDPOINTS:
-                try_url = url.replace('https://api.binance.com', endpoint)
-                
-                try:
-                    # Добавляем случайную задержку между запросами
-                    time.sleep(random.uniform(0.5, 1.5))
-                    
-                    response = requests.get(
-                        try_url, 
-                        params=params, 
-                        headers=HEADERS, 
-                        timeout=20,
-                        # Можно добавить proxy если есть
-                        # proxies=random.choice(PROXY_LIST) if PROXY_LIST else None
-                    )
-                    
-                    if response.status_code == 200:
-                        return response
-                    elif response.status_code == 451:
-                        logger.warning(f"451 error on {endpoint}, trying next endpoint...")
-                        continue
-                    elif response.status_code == 429:
-                        logger.warning(f"Rate limit hit, waiting longer...")
-                        time.sleep(random.uniform(3, 5))
-                        continue
-                    else:
-                        response.raise_for_status()
-                        
-                except requests.exceptions.RequestException as e:
-                    logger.warning(f"Request failed on {endpoint}: {e}")
-                    continue
-        else:
-            # Для не-Binance запросов
-            try:
-                time.sleep(random.uniform(0.3, 0.7))
-                response = requests.get(url, params=params, headers=HEADERS, timeout=15)
-                if response.status_code == 200:
-                    return response
+        try:
+            # Добавляем случайную задержку между запросами
+            time.sleep(random.uniform(0.3, 0.8))
+            
+            response = requests.get(
+                url, 
+                params=params, 
+                headers=HEADERS, 
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                return response
+            elif response.status_code == 429:
+                logger.warning(f"Rate limit hit, waiting longer...")
+                time.sleep(random.uniform(2, 4))
+                continue
+            else:
                 response.raise_for_status()
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"Request failed: {e}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Request failed on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(random.uniform(1, 2))
     
     return None
 
 def validate_ticker(ticker):
-    """Проверяет, существует ли торговая пара на Binance."""
+    """Проверяет, существует ли торговая пара на Bybit."""
     try:
-        url = f"{BINANCE_API_URL}/api/v3/exchangeInfo"
-        params = {'symbol': f"{ticker}USDT"}
+        url = f"{BYBIT_API_URL}/v5/market/instruments-info"
+        params = {
+            'category': 'spot',
+            'symbol': f"{ticker}USDT"
+        }
         
         response = make_request_with_retry(url, params)
         if response is None:
@@ -102,38 +72,102 @@ def validate_ticker(ticker):
             return False
             
         data = response.json()
-        return 'symbols' in data and len(data['symbols']) > 0
+        return data.get('retCode') == 0 and len(data.get('result', {}).get('list', [])) > 0
     except Exception as e:
         logger.error(f"Error validating ticker {ticker}: {e}")
         return False
 
-def get_klines(symbol, interval, limit=100):
+def get_klines(symbol, interval, limit=200):
+    """Получает исторические данные с Bybit API"""
     try:
-        url = f"{BINANCE_API_URL}/api/v3/klines"
-        params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+        # Преобразуем интервалы в формат Bybit
+        bybit_intervals = {
+            '1h': '60',
+            '4h': '240', 
+            '1d': 'D'
+        }
+        
+        if interval not in bybit_intervals:
+            logger.error(f"Unsupported interval: {interval}")
+            return None
+            
+        url = f"{BYBIT_API_URL}/v5/market/kline"
+        params = {
+            'category': 'spot',
+            'symbol': symbol,
+            'interval': bybit_intervals[interval],
+            'limit': limit
+        }
         
         response = make_request_with_retry(url, params)
         if response is None:
             logger.error(f"Failed to get klines for {symbol} after all retries")
             return None
             
-        return response.json()
+        data = response.json()
+        if data.get('retCode') != 0:
+            logger.error(f"Bybit API error for {symbol}: {data.get('retMsg')}")
+            return None
+            
+        # Преобразуем формат данных Bybit в формат Binance для совместимости
+        klines = data.get('result', {}).get('list', [])
+        
+        # Bybit возвращает данные в обратном порядке, исправляем это
+        klines.reverse()
+        
+        # Преобразуем формат: Bybit [timestamp, open, high, low, close, volume, turnover]
+        # в формат Binance [timestamp, open, high, low, close, volume, ...]
+        converted_klines = []
+        for kline in klines:
+            converted_klines.append([
+                int(kline[0]),  # timestamp
+                kline[1],       # open
+                kline[2],       # high
+                kline[3],       # low
+                kline[4],       # close
+                kline[5],       # volume
+                0,              # close_time (не используется)
+                0,              # quote_asset_volume (не используется)
+                0,              # number_of_trades (не используется)
+                0,              # taker_buy_base_asset_volume (не используется)
+                0,              # taker_buy_quote_asset_volume (не используется)
+                0               # ignore (не используется)
+            ])
+        
+        return converted_klines
     except Exception as e:
         logger.error(f"Error getting klines for {symbol}: {e}")
         return None
 
 def get_top_pairs():
+    """Получает топ торговые пары с Bybit"""
     try:
-        url = f"{BINANCE_API_URL}/api/v3/ticker/24hr"
+        url = f"{BYBIT_API_URL}/v5/market/tickers"
+        params = {'category': 'spot'}
         
-        response = make_request_with_retry(url)
+        response = make_request_with_retry(url, params)
         if response is None:
             logger.error("Failed to get top pairs after all retries, using fallback")
             return get_fallback_pairs()
             
-        pairs = [p for p in response.json() if p['symbol'].endswith('USDT')]
+        data = response.json()
+        if data.get('retCode') != 0:
+            logger.error(f"Bybit API error: {data.get('retMsg')}")
+            return get_fallback_pairs()
+            
+        # Фильтруем только USDT пары и преобразуем в формат Binance
+        pairs = []
+        for item in data.get('result', {}).get('list', []):
+            if item['symbol'].endswith('USDT'):
+                pairs.append({
+                    'symbol': item['symbol'],
+                    'volume': item['volume24h'],
+                    'lastPrice': item['lastPrice']
+                })
+        
+        # Сортируем по объему торгов
         sorted_pairs = sorted(pairs, key=lambda x: float(x['volume']) * float(x['lastPrice']), reverse=True)[:50]
-        logger.info(f"Retrieved {len(sorted_pairs)} top pairs")
+        logger.info(f"Retrieved {len(sorted_pairs)} top pairs from Bybit")
         return sorted_pairs
     except Exception as e:
         logger.error(f"Error getting top pairs: {e}")
@@ -229,7 +263,7 @@ async def analyze_ticker(ticker, update):
 
     # Этапы анализа тикера
     steps = [
-        "Подключение к Binance API...",
+        "Подключение к Bybit API...",
         "Загрузка исторических данных...", 
         "Расчет SMA50 и SMA200...",
         "Определение уровней входа...",
@@ -241,7 +275,7 @@ async def analyze_ticker(ticker, update):
     progress_message = await update.message.reply_text("🔄 Запуск анализа...")
 
     if not validate_ticker(ticker):
-        error_msg = f"❌ Ошибка: тикер {ticker} не найден. Попробуйте другой, например, BTC или ETH."
+        error_msg = f"❌ Ошибка: тикер {ticker} не найден на Bybit. Попробуйте другой, например, BTC или ETH."
         await progress_message.edit_text(error_msg)
         logger.warning(f"Ticker {ticker} not found")
         return error_msg
@@ -259,7 +293,7 @@ async def analyze_ticker(ticker, update):
         data_1h = get_klines(symbol, '1h', 50)
 
         if not (data_1d and data_4h and data_1h):
-            error_msg = f"❌ Ошибка: нет данных для {ticker}. API временно недоступно, попробуйте позже."
+            error_msg = f"❌ Ошибка: нет данных для {ticker}. Bybit API временно недоступно, попробуйте позже."
             await progress_message.edit_text(error_msg)
             logger.error(f"No data available for {symbol}")
             return error_msg
@@ -339,7 +373,7 @@ async def analyze_ticker(ticker, update):
         return signal
 
     except Exception as e:
-        error_msg = f"❌ Произошла ошибка при анализе {ticker}. API временно недоступно, попробуйте позже."
+        error_msg = f"❌ Произошла ошибка при анализе {ticker}. Bybit API временно недоступно, попробуйте позже."
         await progress_message.edit_text(error_msg)
         logger.error(f"Error during analysis of {symbol}: {e}")
         return error_msg
@@ -349,7 +383,7 @@ async def get_best_signals(direction, update):
     
     # Этапы поиска лучших сигналов
     steps = [
-        "Сканирование топ-50 пар...",
+        "Сканирование топ-50 пар на Bybit...",
         "Проанализировано: 0/8",
         "Найдено подходящих: 0", 
         "Отбор завершен!"
@@ -363,7 +397,7 @@ async def get_best_signals(direction, update):
 
     pairs = get_top_pairs()
     if not pairs:
-        error_msg = "❌ Ошибка: API временно недоступно. Попробуйте позже."
+        error_msg = "❌ Ошибка: Bybit API временно недоступно. Попробуйте позже."
         await progress_message.edit_text(error_msg)
         logger.error("Could not get top pairs")
         return error_msg
@@ -379,7 +413,7 @@ async def get_best_signals(direction, update):
         signals = []
         processed_count = 0
         found_signals = 0
-        max_to_process = 8  # Уменьшили для стабильности из-за ограничений API
+        max_to_process = 8  # Уменьшили для стабильности
 
         # Выполняем весь анализ в фоне сначала
         for pair in pairs:
@@ -390,8 +424,8 @@ async def get_best_signals(direction, update):
             processed_count += 1
 
             try:
-                # Добавляем увеличенную задержку между запросами
-                await asyncio.sleep(1.0)
+                # Добавляем задержку между запросами
+                await asyncio.sleep(0.8)
                 
                 data_1d = get_klines(symbol, '1d', 200)
                 data_4h = get_klines(symbol, '4h', 100)
@@ -480,7 +514,7 @@ async def get_best_signals(direction, update):
 
         if not signals:
             opposite_direction = 'шорт' if direction == 'long' else 'лонг'
-            result = f"❌ Подходящих пар не найдено. API работает нестабильно. Попробуйте через несколько минут или выберите 'Лучшее в {opposite_direction}'."
+            result = f"❌ Подходящих пар не найдено на Bybit. Попробуйте через несколько минут или выберите 'Лучшее в {opposite_direction}'."
             logger.info(f"No {direction} signals found")
             return result
 
@@ -489,7 +523,7 @@ async def get_best_signals(direction, update):
         return result
 
     except Exception as e:
-        error_msg = f"❌ Произошла ошибка при поиске сигналов. API временно недоступно, попробуйте позже."
+        error_msg = f"❌ Произошла ошибка при поиске сигналов. Bybit API временно недоступно, попробуйте позже."
         await progress_message.edit_text(error_msg)
         logger.error(f"Error during {direction} signals search: {e}")
         return error_msg

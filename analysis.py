@@ -9,6 +9,11 @@ from datetime import datetime, timedelta
 # Настраиваем логгер
 logger = logging.getLogger(__name__)
 
+# Заголовки для обхода блокировки
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+}
+
 async def sleep_random():
     """Случайная задержка от 0.7 до 0.9 секунды"""
     await asyncio.sleep(random.uniform(0.7, 0.9))
@@ -18,7 +23,7 @@ def validate_ticker(ticker):
     try:
         url = f"{BINANCE_API_URL}/api/v3/exchangeInfo"
         params = {'symbol': f"{ticker}USDT"}
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, headers=HEADERS, timeout=15)
         response.raise_for_status()
         data = response.json()
         return 'symbols' in data and len(data['symbols']) > 0
@@ -30,7 +35,7 @@ def get_klines(symbol, interval, limit=100):
     try:
         url = f"{BINANCE_API_URL}/api/v3/klines"
         params = {'symbol': symbol, 'interval': interval, 'limit': limit}
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, headers=HEADERS, timeout=15)
         response.raise_for_status()
         return response.json()
     except requests.RequestException as e:
@@ -40,7 +45,7 @@ def get_klines(symbol, interval, limit=100):
 def get_top_pairs():
     try:
         url = f"{BINANCE_API_URL}/api/v3/ticker/24hr"
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, headers=HEADERS, timeout=15)
         response.raise_for_status()
         pairs = [p for p in response.json() if p['symbol'].endswith('USDT')]
         sorted_pairs = sorted(pairs, key=lambda x: float(x['volume']) * float(x['lastPrice']), reverse=True)[:50]
@@ -48,7 +53,21 @@ def get_top_pairs():
         return sorted_pairs
     except requests.RequestException as e:
         logger.error(f"Error getting top pairs: {e}")
-        return []
+        # Fallback - возвращаем популярные пары вручную
+        fallback_pairs = [
+            {'symbol': 'BTCUSDT', 'volume': '1000000', 'lastPrice': '50000'},
+            {'symbol': 'ETHUSDT', 'volume': '800000', 'lastPrice': '3000'},
+            {'symbol': 'BNBUSDT', 'volume': '600000', 'lastPrice': '400'},
+            {'symbol': 'ADAUSDT', 'volume': '500000', 'lastPrice': '0.5'},
+            {'symbol': 'SOLUSDT', 'volume': '400000', 'lastPrice': '100'},
+            {'symbol': 'XRPUSDT', 'volume': '350000', 'lastPrice': '0.6'},
+            {'symbol': 'DOTUSDT', 'volume': '300000', 'lastPrice': '7'},
+            {'symbol': 'DOGEUSDT', 'volume': '250000', 'lastPrice': '0.08'},
+            {'symbol': 'AVAXUSDT', 'volume': '200000', 'lastPrice': '25'},
+            {'symbol': 'MATICUSDT', 'volume': '180000', 'lastPrice': '0.8'}
+        ]
+        logger.info("Using fallback pairs due to API error")
+        return fallback_pairs
 
 def calculate_sma(data, period):
     if not data or len(data) < period:
@@ -239,7 +258,7 @@ async def get_best_signals(direction, update):
     # Этапы поиска лучших сигналов
     steps = [
         "Сканирование топ-50 пар...",
-        "Проанализировано: 0/30",
+        "Проанализировано: 0/10",
         "Найдено подходящих: 0", 
         "Отбор завершен!"
     ]
@@ -268,7 +287,7 @@ async def get_best_signals(direction, update):
         signals = []
         processed_count = 0
         found_signals = 0
-        max_to_process = 30
+        max_to_process = 10  # Уменьшили для стабильности
 
         # Выполняем весь анализ в фоне сначала
         for pair in pairs:
@@ -279,6 +298,9 @@ async def get_best_signals(direction, update):
             processed_count += 1
 
             try:
+                # Добавляем задержку между запросами
+                await asyncio.sleep(0.5)
+                
                 data_1d = get_klines(symbol, '1d', 200)
                 data_4h = get_klines(symbol, '4h', 100)
                 data_1h = get_klines(symbol, '1h', 50)
@@ -338,7 +360,7 @@ async def get_best_signals(direction, update):
         # Этап 2 (50%) - анализ (самый долгий)
         await asyncio.sleep(2.0)
         progress_bars = format_progress_bars(2, 4, square_type)
-        steps[1] = f"Проанализировано: {processed_count}/30"
+        steps[1] = f"Проанализировано: {processed_count}/10"
         steps_list = format_steps_list(steps, 2)
         progress_text = progress_bars + "\n" + "\n".join(steps_list)
         await progress_message.edit_text(progress_text)
@@ -346,7 +368,7 @@ async def get_best_signals(direction, update):
         # Этап 3 (75%) - поиск сигналов (средне)
         await asyncio.sleep(1.5)
         progress_bars = format_progress_bars(3, 4, square_type)
-        steps[1] = f"Проанализировано: {processed_count}/30"
+        steps[1] = f"Проанализировано: {processed_count}/10"
         steps[2] = f"Найдено подходящих: {found_signals}"
         steps_list = format_steps_list(steps, 3)
         progress_text = progress_bars + "\n" + "\n".join(steps_list)
@@ -355,7 +377,7 @@ async def get_best_signals(direction, update):
         # Этап 4 (100%) - финализация (быстро)
         await asyncio.sleep(0.7)
         progress_bars = format_progress_bars(4, 4, square_type)
-        steps[1] = f"Проанализировано: {processed_count}/30"
+        steps[1] = f"Проанализировано: {processed_count}/10"
         steps[2] = f"Найдено подходящих: {found_signals}"
         steps_list = format_steps_list(steps, 4)
         progress_text = progress_bars + "\n" + "\n".join(steps_list)

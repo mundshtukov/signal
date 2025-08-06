@@ -5,29 +5,105 @@ import logging
 from config import BINANCE_API_URL, COINGECKO_API_URL, ALTERNATIVE_API_URL
 from utils import calculate_risk_reward, format_signal
 from datetime import datetime, timedelta
+import time
 
 # Настраиваем логгер
 logger = logging.getLogger(__name__)
 
-# Заголовки для обхода блокировки
+# Улучшенные заголовки для обхода блокировки
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin'
 }
 
+# Список альтернативных Binance endpoints
+BINANCE_ENDPOINTS = [
+    'https://api.binance.com',
+    'https://api1.binance.com',
+    'https://api2.binance.com',
+    'https://api3.binance.com'
+]
+
+# Список proxy серверов (можно добавить свои)
+PROXY_LIST = [
+    # Добавьте рабочие proxy если есть
+    # {'http': 'http://proxy:port', 'https': 'https://proxy:port'}
+]
+
 async def sleep_random():
-    """Случайная задержка от 0.7 до 0.9 секунды"""
-    await asyncio.sleep(random.uniform(0.7, 0.9))
+    """Случайная задержка от 1 до 2 секунд для избежания rate limiting"""
+    await asyncio.sleep(random.uniform(1.0, 2.0))
+
+def make_request_with_retry(url, params=None, max_retries=3):
+    """Делает запрос с повторными попытками и разными endpoint'ами"""
+    
+    for attempt in range(max_retries):
+        # Пробуем разные endpoints для Binance
+        if 'api.binance.com' in url:
+            for endpoint in BINANCE_ENDPOINTS:
+                try_url = url.replace('https://api.binance.com', endpoint)
+                
+                try:
+                    # Добавляем случайную задержку между запросами
+                    time.sleep(random.uniform(0.5, 1.5))
+                    
+                    response = requests.get(
+                        try_url, 
+                        params=params, 
+                        headers=HEADERS, 
+                        timeout=20,
+                        # Можно добавить proxy если есть
+                        # proxies=random.choice(PROXY_LIST) if PROXY_LIST else None
+                    )
+                    
+                    if response.status_code == 200:
+                        return response
+                    elif response.status_code == 451:
+                        logger.warning(f"451 error on {endpoint}, trying next endpoint...")
+                        continue
+                    elif response.status_code == 429:
+                        logger.warning(f"Rate limit hit, waiting longer...")
+                        time.sleep(random.uniform(3, 5))
+                        continue
+                    else:
+                        response.raise_for_status()
+                        
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Request failed on {endpoint}: {e}")
+                    continue
+        else:
+            # Для не-Binance запросов
+            try:
+                time.sleep(random.uniform(0.3, 0.7))
+                response = requests.get(url, params=params, headers=HEADERS, timeout=15)
+                if response.status_code == 200:
+                    return response
+                response.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Request failed: {e}")
+    
+    return None
 
 def validate_ticker(ticker):
     """Проверяет, существует ли торговая пара на Binance."""
     try:
         url = f"{BINANCE_API_URL}/api/v3/exchangeInfo"
         params = {'symbol': f"{ticker}USDT"}
-        response = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        response.raise_for_status()
+        
+        response = make_request_with_retry(url, params)
+        if response is None:
+            logger.error(f"Failed to validate ticker {ticker} after all retries")
+            return False
+            
         data = response.json()
         return 'symbols' in data and len(data['symbols']) > 0
-    except requests.RequestException as e:
+    except Exception as e:
         logger.error(f"Error validating ticker {ticker}: {e}")
         return False
 
@@ -35,39 +111,55 @@ def get_klines(symbol, interval, limit=100):
     try:
         url = f"{BINANCE_API_URL}/api/v3/klines"
         params = {'symbol': symbol, 'interval': interval, 'limit': limit}
-        response = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        response.raise_for_status()
+        
+        response = make_request_with_retry(url, params)
+        if response is None:
+            logger.error(f"Failed to get klines for {symbol} after all retries")
+            return None
+            
         return response.json()
-    except requests.RequestException as e:
+    except Exception as e:
         logger.error(f"Error getting klines for {symbol}: {e}")
         return None
 
 def get_top_pairs():
     try:
         url = f"{BINANCE_API_URL}/api/v3/ticker/24hr"
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        response.raise_for_status()
+        
+        response = make_request_with_retry(url)
+        if response is None:
+            logger.error("Failed to get top pairs after all retries, using fallback")
+            return get_fallback_pairs()
+            
         pairs = [p for p in response.json() if p['symbol'].endswith('USDT')]
         sorted_pairs = sorted(pairs, key=lambda x: float(x['volume']) * float(x['lastPrice']), reverse=True)[:50]
         logger.info(f"Retrieved {len(sorted_pairs)} top pairs")
         return sorted_pairs
-    except requests.RequestException as e:
+    except Exception as e:
         logger.error(f"Error getting top pairs: {e}")
-        # Fallback - возвращаем популярные пары вручную
-        fallback_pairs = [
-            {'symbol': 'BTCUSDT', 'volume': '1000000', 'lastPrice': '50000'},
-            {'symbol': 'ETHUSDT', 'volume': '800000', 'lastPrice': '3000'},
-            {'symbol': 'BNBUSDT', 'volume': '600000', 'lastPrice': '400'},
-            {'symbol': 'ADAUSDT', 'volume': '500000', 'lastPrice': '0.5'},
-            {'symbol': 'SOLUSDT', 'volume': '400000', 'lastPrice': '100'},
-            {'symbol': 'XRPUSDT', 'volume': '350000', 'lastPrice': '0.6'},
-            {'symbol': 'DOTUSDT', 'volume': '300000', 'lastPrice': '7'},
-            {'symbol': 'DOGEUSDT', 'volume': '250000', 'lastPrice': '0.08'},
-            {'symbol': 'AVAXUSDT', 'volume': '200000', 'lastPrice': '25'},
-            {'symbol': 'MATICUSDT', 'volume': '180000', 'lastPrice': '0.8'}
-        ]
-        logger.info("Using fallback pairs due to API error")
-        return fallback_pairs
+        return get_fallback_pairs()
+
+def get_fallback_pairs():
+    """Возвращает популярные пары как fallback"""
+    fallback_pairs = [
+        {'symbol': 'BTCUSDT', 'volume': '1000000', 'lastPrice': '50000'},
+        {'symbol': 'ETHUSDT', 'volume': '800000', 'lastPrice': '3000'},
+        {'symbol': 'BNBUSDT', 'volume': '600000', 'lastPrice': '400'},
+        {'symbol': 'ADAUSDT', 'volume': '500000', 'lastPrice': '0.5'},
+        {'symbol': 'SOLUSDT', 'volume': '400000', 'lastPrice': '100'},
+        {'symbol': 'XRPUSDT', 'volume': '350000', 'lastPrice': '0.6'},
+        {'symbol': 'DOTUSDT', 'volume': '300000', 'lastPrice': '7'},
+        {'symbol': 'DOGEUSDT', 'volume': '250000', 'lastPrice': '0.08'},
+        {'symbol': 'AVAXUSDT', 'volume': '200000', 'lastPrice': '25'},
+        {'symbol': 'MATICUSDT', 'volume': '180000', 'lastPrice': '0.8'},
+        {'symbol': 'LINKUSDT', 'volume': '170000', 'lastPrice': '12'},
+        {'symbol': 'UNIUSDT', 'volume': '160000', 'lastPrice': '8'},
+        {'symbol': 'LTCUSDT', 'volume': '150000', 'lastPrice': '90'},
+        {'symbol': 'BCHUSDT', 'volume': '140000', 'lastPrice': '250'},
+        {'symbol': 'XLMUSDT', 'volume': '130000', 'lastPrice': '0.12'}
+    ]
+    logger.info("Using extended fallback pairs due to API error")
+    return fallback_pairs
 
 def calculate_sma(data, period):
     if not data or len(data) < period:
@@ -167,7 +259,7 @@ async def analyze_ticker(ticker, update):
         data_1h = get_klines(symbol, '1h', 50)
 
         if not (data_1d and data_4h and data_1h):
-            error_msg = f"❌ Ошибка: нет данных для {ticker}. Попробуйте другую монету."
+            error_msg = f"❌ Ошибка: нет данных для {ticker}. API временно недоступно, попробуйте позже."
             await progress_message.edit_text(error_msg)
             logger.error(f"No data available for {symbol}")
             return error_msg
@@ -247,7 +339,7 @@ async def analyze_ticker(ticker, update):
         return signal
 
     except Exception as e:
-        error_msg = f"❌ Произошла ошибка при анализе {ticker}. Попробуйте еще раз."
+        error_msg = f"❌ Произошла ошибка при анализе {ticker}. API временно недоступно, попробуйте позже."
         await progress_message.edit_text(error_msg)
         logger.error(f"Error during analysis of {symbol}: {e}")
         return error_msg
@@ -258,7 +350,7 @@ async def get_best_signals(direction, update):
     # Этапы поиска лучших сигналов
     steps = [
         "Сканирование топ-50 пар...",
-        "Проанализировано: 0/10",
+        "Проанализировано: 0/8",
         "Найдено подходящих: 0", 
         "Отбор завершен!"
     ]
@@ -271,7 +363,7 @@ async def get_best_signals(direction, update):
 
     pairs = get_top_pairs()
     if not pairs:
-        error_msg = "❌ Ошибка: не удалось получить список торговых пар."
+        error_msg = "❌ Ошибка: API временно недоступно. Попробуйте позже."
         await progress_message.edit_text(error_msg)
         logger.error("Could not get top pairs")
         return error_msg
@@ -287,7 +379,7 @@ async def get_best_signals(direction, update):
         signals = []
         processed_count = 0
         found_signals = 0
-        max_to_process = 10  # Уменьшили для стабильности
+        max_to_process = 8  # Уменьшили для стабильности из-за ограничений API
 
         # Выполняем весь анализ в фоне сначала
         for pair in pairs:
@@ -298,8 +390,8 @@ async def get_best_signals(direction, update):
             processed_count += 1
 
             try:
-                # Добавляем задержку между запросами
-                await asyncio.sleep(0.5)
+                # Добавляем увеличенную задержку между запросами
+                await asyncio.sleep(1.0)
                 
                 data_1d = get_klines(symbol, '1d', 200)
                 data_4h = get_klines(symbol, '4h', 100)
@@ -360,7 +452,7 @@ async def get_best_signals(direction, update):
         # Этап 2 (50%) - анализ (самый долгий)
         await asyncio.sleep(2.0)
         progress_bars = format_progress_bars(2, 4, square_type)
-        steps[1] = f"Проанализировано: {processed_count}/10"
+        steps[1] = f"Проанализировано: {processed_count}/8"
         steps_list = format_steps_list(steps, 2)
         progress_text = progress_bars + "\n" + "\n".join(steps_list)
         await progress_message.edit_text(progress_text)
@@ -368,7 +460,7 @@ async def get_best_signals(direction, update):
         # Этап 3 (75%) - поиск сигналов (средне)
         await asyncio.sleep(1.5)
         progress_bars = format_progress_bars(3, 4, square_type)
-        steps[1] = f"Проанализировано: {processed_count}/10"
+        steps[1] = f"Проанализировано: {processed_count}/8"
         steps[2] = f"Найдено подходящих: {found_signals}"
         steps_list = format_steps_list(steps, 3)
         progress_text = progress_bars + "\n" + "\n".join(steps_list)
@@ -377,7 +469,7 @@ async def get_best_signals(direction, update):
         # Этап 4 (100%) - финализация (быстро)
         await asyncio.sleep(0.7)
         progress_bars = format_progress_bars(4, 4, square_type)
-        steps[1] = f"Проанализировано: {processed_count}/10"
+        steps[1] = f"Проанализировано: {processed_count}/8"
         steps[2] = f"Найдено подходящих: {found_signals}"
         steps_list = format_steps_list(steps, 4)
         progress_text = progress_bars + "\n" + "\n".join(steps_list)
@@ -388,7 +480,7 @@ async def get_best_signals(direction, update):
 
         if not signals:
             opposite_direction = 'шорт' if direction == 'long' else 'лонг'
-            result = f"❌ Подходящих пар не найдено. Попробуйте позже или выберите 'Лучшее в {opposite_direction}'."
+            result = f"❌ Подходящих пар не найдено. API работает нестабильно. Попробуйте через несколько минут или выберите 'Лучшее в {opposite_direction}'."
             logger.info(f"No {direction} signals found")
             return result
 
@@ -397,7 +489,7 @@ async def get_best_signals(direction, update):
         return result
 
     except Exception as e:
-        error_msg = f"❌ Произошла ошибка при поиске сигналов. Попробуйте еще раз."
+        error_msg = f"❌ Произошла ошибка при поиске сигналов. API временно недоступно, попробуйте позже."
         await progress_message.edit_text(error_msg)
         logger.error(f"Error during {direction} signals search: {e}")
         return error_msg
